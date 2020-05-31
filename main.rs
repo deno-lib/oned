@@ -2,7 +2,16 @@
 extern crate derive_deref;
 #[macro_use]
 extern crate log;
-extern crate deno_core;
+
+use std::cell::RefCell;
+use std::convert::TryInto;
+use std::env;
+use std::fmt::Debug;
+use std::io::Error;
+use std::mem::size_of;
+use std::pin::Pin;
+use std::ptr;
+use std::rc::Rc; // single-threaded reference-counting pointer
 
 use deno_core::CoreIsolate;
 use deno_core::Op;
@@ -10,41 +19,13 @@ use deno_core::ResourceTable;
 use deno_core::Script;
 use deno_core::StartupData;
 use deno_core::ZeroCopyBuf;
+
 use futures::future::poll_fn;
 use futures::prelude::*;
 use futures::task::Context;
 use futures::task::Poll;
-use std::cell::RefCell;
-use std::convert::TryInto;
-use std::env;
-use std::fmt::Debug;
-use std::io::Error;
-use std::io::ErrorKind;
-use std::mem::size_of;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::ptr;
-use std::rc::Rc;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncWrite;
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
 
-struct Logger;
-
-impl log::Log for Logger {
-  fn enabled(&self, metadata: &log::Metadata) -> bool {
-    metadata.level() <= log::max_level()
-  }
-
-  fn log(&self, record: &log::Record) {
-    if self.enabled(record.metadata()) {
-      println!("{} - {}", record.level(), record.args());
-    }
-  }
-
-  fn flush(&self) {}
-}
+use crate::state::State;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 struct Record {
@@ -78,23 +59,15 @@ impl From<Record> for RecordBuf {
 }
 
 struct Isolate {
-  core_isolate: Box<CoreIsolate>, // Unclear why CoreIsolate::new() returns a box.
-  state: State,
-}
-
-#[derive(Clone, Default, Deref)]
-struct State(Rc<RefCell<StateInner>>);
-
-#[derive(Default)]
-struct StateInner {
-  resource_table: ResourceTable,
+	core_isolate: Box<CoreIsolate>,
+	state: State,
 }
 
 impl Isolate {
   pub fn new() -> Self {
     let startup_data = StartupData::Script(Script {
-      source: include_str!("oned.js"),
-      filename: "oned.js",
+      source: include_str!("main.js"),
+      filename: "main.js",
     });
 
     let mut isolate = Self {
@@ -102,11 +75,9 @@ impl Isolate {
       state: Default::default(),
     };
 
-    isolate.register_sync_op("listen", op_listen);
-    isolate.register_op("accept", op_accept);
-    isolate.register_op("read", op_read);
-    isolate.register_op("write", op_write);
-    isolate.register_sync_op("close", op_close);
+    isolate.register_sync_op("run", op_run);
+    isolate.register_sync_op("kill", op_kill);
+    isolate.register_op("status", op_status);
 
     isolate
   }
@@ -179,121 +150,38 @@ impl Future for Isolate {
   }
 }
 
-fn op_close(
-  state: State,
-  rid: u32,
-  _buf: Option<ZeroCopyBuf>,
-) -> Result<u32, Error> {
-  debug!("close rid={}", rid);
-  let resource_table = &mut state.borrow_mut().resource_table;
-  resource_table
-    .close(rid)
-    .map(|_| 0)
-    .ok_or_else(bad_resource)
-}
-
-fn op_listen(
+fn op_run(
   state: State,
   _rid: u32,
   _buf: Option<ZeroCopyBuf>,
 ) -> Result<u32, Error> {
-  debug!("listen");
-  let addr = "127.0.0.1:4545".parse::<SocketAddr>().unwrap();
-  let std_listener = std::net::TcpListener::bind(&addr)?;
-  let listener = TcpListener::from_std(std_listener)?;
-  let resource_table = &mut state.borrow_mut().resource_table;
-  let rid = resource_table.add("tcpListener", Box::new(listener));
-  Ok(rid)
+  debug!("run");
+  Ok(0)
 }
 
-fn op_accept(
+fn op_kill(
+  state: State,
+  _rid: u32,
+  _buf: Option<ZeroCopyBuf>,
+) -> Result<u32, Error> {
+  debug!("kill");
+  Ok(0)
+}
+
+fn op_status(
   state: State,
   rid: u32,
   _buf: Option<ZeroCopyBuf>,
 ) -> impl TryFuture<Ok = u32, Error = Error> {
-  debug!("accept rid={}", rid);
+  debug!("run status rid={}", rid);
 
   poll_fn(move |cx| {
-    let resource_table = &mut state.borrow_mut().resource_table;
-    let listener = resource_table
-      .get_mut::<TcpListener>(rid)
-      .ok_or_else(bad_resource)?;
-    listener.poll_accept(cx).map_ok(|(stream, _addr)| {
-      resource_table.add("tcpStream", Box::new(stream))
-    })
   })
-}
-
-fn op_read(
-  state: State,
-  rid: u32,
-  buf: Option<ZeroCopyBuf>,
-) -> impl TryFuture<Ok = usize, Error = Error> {
-  let mut buf = buf.unwrap();
-  debug!("read rid={}", rid);
-
-  poll_fn(move |cx| {
-    let resource_table = &mut state.borrow_mut().resource_table;
-    let stream = resource_table
-      .get_mut::<TcpStream>(rid)
-      .ok_or_else(bad_resource)?;
-    Pin::new(stream).poll_read(cx, &mut buf)
-  })
-}
-
-fn op_write(
-  state: State,
-  rid: u32,
-  buf: Option<ZeroCopyBuf>,
-) -> impl TryFuture<Ok = usize, Error = Error> {
-  let buf = buf.unwrap();
-  debug!("write rid={}", rid);
-
-  poll_fn(move |cx| {
-    let resource_table = &mut state.borrow_mut().resource_table;
-    let stream = resource_table
-      .get_mut::<TcpStream>(rid)
-      .ok_or_else(bad_resource)?;
-    Pin::new(stream).poll_write(cx, &buf)
-  })
-}
-
-fn bad_resource() -> Error {
-  Error::new(ErrorKind::NotFound, "bad resource id")
 }
 
 fn main() {
-  log::set_logger(&Logger).unwrap();
-  log::set_max_level(
-    env::args()
-      .find(|a| a == "-D")
-      .map(|_| log::LevelFilter::Debug)
-      .unwrap_or(log::LevelFilter::Warn),
-  );
-
   // NOTE: `--help` arg will display V8 help and exit
   deno_core::v8_set_flags(env::args().collect());
 
   let isolate = Isolate::new();
-  let mut runtime = tokio::runtime::Builder::new()
-    .basic_scheduler()
-    .enable_all()
-    .build()
-    .unwrap();
-  runtime.block_on(isolate).expect("unexpected isolate error");
-}
-
-#[test]
-fn test_record_from() {
-  let expected = Record {
-    promise_id: 1,
-    rid: 3,
-    result: 4,
-  };
-  let buf = RecordBuf::from(expected);
-  if cfg!(target_endian = "little") {
-    assert_eq!(buf, [1u8, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]);
-  }
-  let actual = Record::from(buf);
-  assert_eq!(actual, expected);
 }

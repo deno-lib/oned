@@ -1,15 +1,17 @@
 [package]
 name = "oned"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2018"
 
 [dependencies]
 deno_core = { git = "https://github.com/denoland/deno" }
 derive_deref = "1.1.0"
-tokio = { version = "0.2.20", features = ["rt-core", "tcp"] }
-log = "0.4.8"
 futures = { version = "0.3.4", features = ["thread-pool", "compat"] }
+log = "0.4.8"
+serde = { version = "1.0.106", features = ["derive"] }
+serde_derive = "1.0.106"
+serde_json = { version = "1.0.52", features = [ "preserve_order" ] }
 
 [[bin]]
 name = "oned"
-path = "oned.rs"
+path = "main.rs"
